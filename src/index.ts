@@ -7,65 +7,42 @@ import { Client } from "@xhayper/discord-rpc"
  * Shows "Playing OpenCode" on your Discord profile with the current
  * project name and a detailed real-time status of what the agent is doing.
  *
- * Tracks:
- *   - All 15+ built-in tools (bash, edit, write, read, grep, glob, list,
- *     patch, webfetch, websearch, todowrite, todoread, lsp, skill, question)
- *   - Session lifecycle (created, idle, error, compacted, deleted)
- *   - File edits and file watcher updates
- *   - Agent modes (Build, Plan, Explore, General)
- *   - Permission prompts
- *   - Slash commands (/init, /undo, /redo, /share, /compact, etc.)
- *   - Message activity
+ * State Management:
+ *   - Reconnects automatically if Discord is restarted or the IPC drops
+ *   - Heartbeat every 15s re-sends the last known presence so it never goes stale
+ *   - Clears presence synchronously on process exit via SIGINT/SIGTERM
+ *   - Persists last known state so it can be restored after reconnect
  *
  * Prerequisites:
  *   1. Create a Discord Application at https://discord.com/developers/applications
  *   2. Set the application name to "OpenCode" (this becomes the "Playing ..." text)
  *   3. Upload a Rich Presence art asset named "opencode_logo"
  *   4. Set the DISCORD_RPC_CLIENT_ID env var to your application's Client ID
- *      or hardcode it below.
  */
 
 // ─── Configuration ──────────────────────────────────────────────────────────
-const CLIENT_ID = process.env.DISCORD_RPC_CLIENT_ID ?? "DISCORD_APP_ID_PLACEHOLDER"
+const CLIENT_ID = process.env.DISCORD_RPC_CLIENT_ID
 const LARGE_IMAGE_KEY = "opencode_logo"
 const LARGE_IMAGE_TEXT = "OpenCode - AI Coding Agent"
-
-// ─── State ──────────────────────────────────────────────────────────────────
-let rpcClient: Client | null = null
-let sessionStartTimestamp: Date | null = null
-let connected = false
-let lastStatus = ""
-let filesEdited = 0
-let commandsRun = 0
+const HEARTBEAT_INTERVAL_MS = 15_000
+const RECONNECT_INTERVAL_MS = 10_000
 
 // ─── Tool → Status mapping ─────────────────────────────────────────────────
-// Maps every built-in OpenCode tool to a human-readable status string.
 const TOOL_STATUS: Record<string, string> = {
-  // File mutation tools
   bash: "Running shell commands",
   edit: "Editing code",
   write: "Writing files",
   patch: "Applying patches",
-
-  // File reading tools
   read: "Reading files",
   grep: "Searching codebase",
   glob: "Finding files by pattern",
   list: "Browsing directories",
-
-  // Intelligence tools
   lsp: "Querying LSP (code intelligence)",
   skill: "Loading agent skill",
-
-  // Web tools
   webfetch: "Fetching web content",
   websearch: "Searching the web",
-
-  // Task management tools
   todowrite: "Updating task list",
   todoread: "Reviewing tasks",
-
-  // Interaction tools
   question: "Asking a question",
 }
 
@@ -93,76 +70,221 @@ const COMMAND_STATUS: Record<string, string> = {
   thinking: "Toggling thinking view",
 }
 
-// ─── RPC Connection ─────────────────────────────────────────────────────────
-async function connectRPC(): Promise<boolean> {
-  if (connected && rpcClient) return true
+// ─── Presence Manager ───────────────────────────────────────────────────────
+// Centralizes all RPC state, reconnection logic, and heartbeating.
+class PresenceManager {
+  private client: Client | null = null
+  private connected = false
+  private connecting = false
+  private destroyed = false
 
-  try {
-    rpcClient = new Client({ clientId: CLIENT_ID })
-    await rpcClient.login()
-    connected = true
-    return true
-  } catch (err) {
-    console.error("[discord-rpc] Failed to connect:", err)
-    connected = false
-    rpcClient = null
-    return false
+  // Last known presence so we can re-send it after reconnect
+  private lastActivity: {
+    details: string
+    state: string
+    startTimestamp: Date
+  } | null = null
+
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private reconnectTimer: ReturnType<typeof setInterval> | null = null
+
+  public sessionStart: Date = new Date()
+  public filesEdited = 0
+  public commandsRun = 0
+
+  constructor(private projectName: string) {}
+
+  // ── Connect ─────────────────────────────────────────────────────────────
+  async connect(): Promise<boolean> {
+    if (this.destroyed) return false
+    if (this.connected && this.client) return true
+    if (this.connecting) return false
+
+    this.connecting = true
+    try {
+      // Destroy old client if lingering
+      if (this.client) {
+        try { await this.client.destroy() } catch {}
+        this.client = null
+      }
+
+      this.client = new Client({ clientId: CLIENT_ID })
+
+      // Listen for the underlying transport closing so we know immediately
+      this.client.on("disconnected", () => {
+        this.connected = false
+        this.startReconnectLoop()
+      })
+
+      await this.client.login()
+      this.connected = true
+      this.connecting = false
+
+      // Stop reconnect loop if it was running
+      this.stopReconnectLoop()
+
+      // Re-send last known presence immediately
+      if (this.lastActivity) {
+        await this.sendActivity(
+          this.lastActivity.details,
+          this.lastActivity.state,
+          this.lastActivity.startTimestamp
+        )
+      }
+
+      // Start heartbeat
+      this.startHeartbeat()
+
+      return true
+    } catch {
+      this.connected = false
+      this.connecting = false
+      this.client = null
+      this.startReconnectLoop()
+      return false
+    }
   }
-}
 
-async function updatePresence(
-  projectName: string,
-  state: string,
-  extraDetails?: string
-): Promise<void> {
-  if (!rpcClient || !connected) {
-    const ok = await connectRPC()
-    if (!ok) return
-  }
+  // ── Update Presence ─────────────────────────────────────────────────────
+  async update(state: string, extraDetails?: string): Promise<void> {
+    const details = extraDetails
+      ? `${this.projectName} · ${extraDetails}`
+      : `Working on ${this.projectName}`
 
-  // Avoid spamming Discord with duplicate updates
-  if (state === lastStatus && !extraDetails) return
-  lastStatus = state
-
-  const details = extraDetails
-    ? `${projectName} · ${extraDetails}`
-    : `Working on ${projectName}`
-
-  try {
-    await rpcClient!.user?.setActivity({
+    // Always save state even if not connected -- will be sent on reconnect
+    this.lastActivity = {
       details,
       state,
-      startTimestamp: sessionStartTimestamp ?? new Date(),
-      largeImageKey: LARGE_IMAGE_KEY,
-      largeImageText: LARGE_IMAGE_TEXT,
-      instance: false,
-    })
-  } catch (err) {
-    console.error("[discord-rpc] Failed to set activity:", err)
-    connected = false
-  }
-}
+      startTimestamp: this.sessionStart,
+    }
 
-async function clearPresence(): Promise<void> {
-  if (!rpcClient || !connected) return
-  try {
-    await rpcClient.user?.clearActivity()
-  } catch {
-    // ignore
-  }
-}
+    if (!this.connected || !this.client) {
+      // Try to connect; if it fails the reconnect loop will handle it
+      await this.connect()
+      return
+    }
 
-async function destroyRPC(): Promise<void> {
-  if (!rpcClient) return
-  try {
-    await clearPresence()
-    await rpcClient.destroy()
-  } catch {
-    // ignore
-  } finally {
-    rpcClient = null
-    connected = false
-    sessionStartTimestamp = null
+    await this.sendActivity(details, state, this.sessionStart)
+  }
+
+  // ── Clear Presence ──────────────────────────────────────────────────────
+  async clear(): Promise<void> {
+    this.lastActivity = null
+    if (!this.connected || !this.client) return
+    try {
+      await this.client.user?.clearActivity()
+    } catch {}
+  }
+
+  // ── Destroy (cleanup on exit) ───────────────────────────────────────────
+  async destroy(): Promise<void> {
+    this.destroyed = true
+    this.stopHeartbeat()
+    this.stopReconnectLoop()
+
+    if (this.client) {
+      try {
+        await this.client.user?.clearActivity()
+        await this.client.destroy()
+      } catch {}
+      this.client = null
+    }
+    this.connected = false
+    this.lastActivity = null
+  }
+
+  // Synchronous best-effort cleanup for process exit
+  destroySync(): void {
+    this.destroyed = true
+    this.stopHeartbeat()
+    this.stopReconnectLoop()
+    // Can't await here, but at least mark everything as dead
+    // The RPC socket will be closed when the process exits
+    if (this.client) {
+      try { this.client.destroy() } catch {}
+      this.client = null
+    }
+    this.connected = false
+  }
+
+  // ── Stats ───────────────────────────────────────────────────────────────
+  statsLine(): string {
+    const parts: string[] = []
+    if (this.filesEdited > 0)
+      parts.push(`${this.filesEdited} file${this.filesEdited > 1 ? "s" : ""} edited`)
+    if (this.commandsRun > 0)
+      parts.push(`${this.commandsRun} cmd${this.commandsRun > 1 ? "s" : ""} run`)
+    return parts.length > 0 ? parts.join(" · ") : ""
+  }
+
+  resetSession(): void {
+    this.sessionStart = new Date()
+    this.filesEdited = 0
+    this.commandsRun = 0
+  }
+
+  // ── Internal ────────────────────────────────────────────────────────────
+  private async sendActivity(details: string, state: string, startTimestamp: Date): Promise<void> {
+    try {
+      await this.client!.user?.setActivity({
+        details,
+        state,
+        startTimestamp,
+        largeImageKey: LARGE_IMAGE_KEY,
+        largeImageText: LARGE_IMAGE_TEXT,
+        instance: false,
+      })
+    } catch {
+      // Connection likely dropped
+      this.connected = false
+      this.startReconnectLoop()
+    }
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat()
+    this.heartbeatTimer = setInterval(async () => {
+      if (!this.connected || !this.client || !this.lastActivity) return
+      // Re-send the last known presence to keep it alive
+      await this.sendActivity(
+        this.lastActivity.details,
+        this.lastActivity.state,
+        this.lastActivity.startTimestamp
+      )
+    }, HEARTBEAT_INTERVAL_MS)
+    // Don't keep the process alive just for the heartbeat
+    if (this.heartbeatTimer && typeof this.heartbeatTimer === "object" && "unref" in this.heartbeatTimer) {
+      (this.heartbeatTimer as NodeJS.Timeout).unref()
+    }
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+  }
+
+  private startReconnectLoop(): void {
+    if (this.destroyed || this.reconnectTimer) return
+    this.stopHeartbeat()
+    this.reconnectTimer = setInterval(async () => {
+      if (this.destroyed) {
+        this.stopReconnectLoop()
+        return
+      }
+      await this.connect()
+    }, RECONNECT_INTERVAL_MS)
+    if (this.reconnectTimer && typeof this.reconnectTimer === "object" && "unref" in this.reconnectTimer) {
+      (this.reconnectTimer as NodeJS.Timeout).unref()
+    }
+  }
+
+  private stopReconnectLoop(): void {
+    if (this.reconnectTimer) {
+      clearInterval(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
   }
 }
 
@@ -177,195 +299,178 @@ function getFileName(filePath: string): string {
   return parts[parts.length - 1] || filePath
 }
 
-function statsLine(): string {
-  const parts: string[] = []
-  if (filesEdited > 0) parts.push(`${filesEdited} file${filesEdited > 1 ? "s" : ""} edited`)
-  if (commandsRun > 0) parts.push(`${commandsRun} cmd${commandsRun > 1 ? "s" : ""} run`)
-  return parts.length > 0 ? parts.join(" · ") : ""
+// ─── Utility: Non-blocking RPC update ───────────────────────────────────────
+// Prevents Discord RPC from blocking tool execution
+function fireAndForget<T>(promise: Promise<T>): void {
+  promise.catch(() => {}) // Silently ignore errors
 }
 
 // ─── Plugin Entry ───────────────────────────────────────────────────────────
 export const DiscordRichPresencePlugin: Plugin = async ({ directory }) => {
   const projectName = getProjectName(directory)
 
-  if (CLIENT_ID === "REPLACE_WITH_YOUR_CLIENT_ID") {
+  if (!CLIENT_ID) {
     console.warn(
-      "[discord-rpc] No client ID configured. Set DISCORD_RPC_CLIENT_ID env var " +
-        "or replace the default in the plugin source."
+      "[discord-rpc] No client ID configured. Set DISCORD_RPC_CLIENT_ID env var."
     )
     return {}
   }
 
-  // Connect and set initial presence
-  sessionStartTimestamp = new Date()
-  filesEdited = 0
-  commandsRun = 0
-  const ok = await connectRPC()
-  if (ok) {
-    await updatePresence(projectName, "Starting session")
-  }
+  const presence = new PresenceManager(projectName)
+
+  // Connect and set initial presence (fire-and-forget)
+  fireAndForget(presence.connect().then(() => 
+    presence.update("Idle — waiting for input")
+  ))
 
   // Cleanup on process exit
-  const cleanup = () => { destroyRPC() }
-  process.on("exit", cleanup)
-  process.on("SIGINT", cleanup)
-  process.on("SIGTERM", cleanup)
+  process.on("SIGINT", () => { presence.destroySync() })
+  process.on("SIGTERM", () => { presence.destroySync() })
+  process.on("exit", () => { presence.destroySync() })
 
   return {
     // ── Session & general events ──────────────────────────────────────────
     event: async ({ event }) => {
-      switch (event.type) {
-        // Session lifecycle
-        case "session.created":
-          sessionStartTimestamp = new Date()
-          filesEdited = 0
-          commandsRun = 0
-          await updatePresence(projectName, "New session started")
-          break
+      try {
+        switch (event.type) {
+          case "session.created":
+            presence.resetSession()
+            fireAndForget(presence.update("New session started"))
+            break
 
-        case "session.updated":
-          await updatePresence(projectName, "Thinking...", statsLine())
-          break
+          case "session.updated":
+            fireAndForget(presence.update("Thinking...", presence.statsLine()))
+            break
 
-        case "session.idle":
-          await updatePresence(projectName, "Idle — waiting for input", statsLine())
-          break
+          case "session.idle":
+            fireAndForget(presence.update("Idle — waiting for input", presence.statsLine()))
+            break
 
-        case "session.error":
-          await updatePresence(projectName, "Handling an error")
-          break
+          case "session.error":
+            fireAndForget(presence.update("Handling an error"))
+            break
 
-        case "session.compacted":
-          await updatePresence(projectName, "Context compacted", statsLine())
-          break
+          case "session.compacted":
+            fireAndForget(presence.update("Context compacted", presence.statsLine()))
+            break
 
-        case "session.deleted":
-          await clearPresence()
-          break
+          case "session.deleted":
+            fireAndForget(presence.clear())
+            break
 
-        case "session.diff":
-          await updatePresence(projectName, "Reviewing diff")
-          break
+          case "session.diff":
+            fireAndForget(presence.update("Reviewing diff"))
+            break
 
-        case "session.status":
-          await updatePresence(projectName, "Processing...", statsLine())
-          break
+          case "session.status":
+            fireAndForget(presence.update("Processing...", presence.statsLine()))
+            break
 
-        // File events
-        case "file.edited":
-          filesEdited++
-          await updatePresence(projectName, "File changed", statsLine())
-          break
+          case "file.edited":
+            presence.filesEdited++
+            fireAndForget(presence.update("File changed", presence.statsLine()))
+            break
 
-        case "file.watcher.updated":
-          await updatePresence(projectName, "Detected external file change")
-          break
+          case "file.watcher.updated":
+            fireAndForget(presence.update("Detected external file change"))
+            break
 
-        // Message events — the agent is actively responding
-        case "message.updated":
-        case "message.part.updated":
-          await updatePresence(projectName, "Generating response...", statsLine())
-          break
+          case "message.updated":
+          case "message.part.updated":
+            fireAndForget(presence.update("Generating response...", presence.statsLine()))
+            break
 
-        // Permission events
-        case "permission.asked":
-          await updatePresence(projectName, "Waiting for permission")
-          break
+          case "permission.asked":
+            fireAndForget(presence.update("Waiting for permission"))
+            break
 
-        case "permission.replied":
-          await updatePresence(projectName, "Permission granted — continuing")
-          break
+          case "permission.replied":
+            fireAndForget(presence.update("Permission granted — continuing"))
+            break
 
-        // Command events (slash commands like /init, /undo, /redo, etc.)
-        case "command.executed":
-          {
-            const cmd = (event as any).properties?.command ?? ""
-            const cmdStatus = COMMAND_STATUS[cmd] ?? `Running /${cmd}`
-            await updatePresence(projectName, cmdStatus)
-          }
-          break
+          case "command.executed":
+            {
+              const cmd = (event as any).properties?.command ?? ""
+              const cmdStatus = COMMAND_STATUS[cmd] ?? `Running /${cmd}`
+              fireAndForget(presence.update(cmdStatus))
+            }
+            break
 
-        // LSP diagnostics
-        case "lsp.client.diagnostics":
-          await updatePresence(projectName, "Reviewing diagnostics (LSP)")
-          break
+          case "lsp.client.diagnostics":
+            fireAndForget(presence.update("Reviewing diagnostics (LSP)"))
+            break
 
-        case "lsp.updated":
-          await updatePresence(projectName, "LSP server updated")
-          break
+          case "lsp.updated":
+            fireAndForget(presence.update("LSP server updated"))
+            break
 
-        // Todo events
-        case "todo.updated":
-          await updatePresence(projectName, "Managing tasks", statsLine())
-          break
+          case "todo.updated":
+            fireAndForget(presence.update("Managing tasks", presence.statsLine()))
+            break
 
-        default:
-          break
+          default:
+            break
+        }
+      } catch {
+        // Silently ignore errors to prevent breaking event handling
       }
     },
 
     // ── Tool hooks ────────────────────────────────────────────────────────
+    // CRITICAL: These hooks must NEVER block or throw - they run on every tool execution
     "tool.execute.before": async (input, _output) => {
-      const toolName = input.tool
+      try {
+        const toolName = input.tool
 
-      // Track counters
-      if (toolName === "bash") commandsRun++
-      if (toolName === "edit" || toolName === "write" || toolName === "patch") filesEdited++
+        if (toolName === "bash") presence.commandsRun++
+        if (toolName === "edit" || toolName === "write" || toolName === "patch") presence.filesEdited++
 
-      // Build a descriptive status from the tool name
-      let status = TOOL_STATUS[toolName]
+        let status = TOOL_STATUS[toolName]
 
-      // If the tool is from an MCP server (prefixed), show the server name
-      if (!status && toolName.includes("_")) {
-        const parts = toolName.split("_")
-        const server = parts[0]
-        const tool = parts.slice(1).join("_")
-        status = `Using ${server}: ${tool}`
-      }
-
-      // Fallback for unknown / custom tools
-      if (!status) {
-        status = `Using tool: ${toolName}`
-      }
-
-      // Add contextual details for specific tools
-      let extra = statsLine()
-      const args = (input as any).args ?? {}
-
-      if (toolName === "bash" && args.command) {
-        const cmd = String(args.command)
-        const shortCmd = cmd.length > 40 ? cmd.substring(0, 40) + "..." : cmd
-        extra = `$ ${shortCmd}`
-      } else if ((toolName === "edit" || toolName === "write" || toolName === "read") && args.filePath) {
-        extra = getFileName(args.filePath)
-      } else if (toolName === "grep" && args.pattern) {
-        extra = `/${args.pattern}/`
-      } else if (toolName === "glob" && args.pattern) {
-        extra = args.pattern
-      } else if (toolName === "webfetch" && args.url) {
-        const url = String(args.url)
-        try {
-          extra = new URL(url).hostname
-        } catch {
-          extra = url.substring(0, 40)
+        if (!status && toolName.includes("_")) {
+          const parts = toolName.split("_")
+          const server = parts[0]
+          const tool = parts.slice(1).join("_")
+          status = `Using ${server}: ${tool}`
         }
-      } else if (toolName === "websearch" && args.query) {
-        extra = String(args.query).substring(0, 50)
-      }
 
-      await updatePresence(projectName, status, extra || undefined)
+        if (!status) {
+          status = `Using tool: ${toolName}`
+        }
+
+        let extra = presence.statsLine()
+        const args = (input as any).args ?? {}
+
+        if (toolName === "bash" && args.command) {
+          const cmd = String(args.command)
+          extra = `$ ${cmd.length > 40 ? cmd.substring(0, 40) + "..." : cmd}`
+        } else if ((toolName === "edit" || toolName === "write" || toolName === "read") && args.filePath) {
+          extra = getFileName(args.filePath)
+        } else if (toolName === "grep" && args.pattern) {
+          extra = `/${args.pattern}/`
+        } else if (toolName === "glob" && args.pattern) {
+          extra = args.pattern
+        } else if (toolName === "webfetch" && args.url) {
+          try { extra = new URL(String(args.url)).hostname } catch { extra = String(args.url).substring(0, 40) }
+        } else if (toolName === "websearch" && args.query) {
+          extra = String(args.query).substring(0, 50)
+        }
+
+        // Fire-and-forget: never block tool execution
+        fireAndForget(presence.update(status, extra || undefined))
+      } catch {
+        // Silently ignore errors
+      }
     },
 
     "tool.execute.after": async (_input, _output) => {
-      // Reset the dedup guard so the next event can update
-      lastStatus = ""
-      await updatePresence(projectName, "Thinking...", statsLine())
+      // Fire-and-forget: never block tool execution
+      fireAndForget(presence.update("Thinking...", presence.statsLine()))
     },
 
-    // ── File edit hook ────────────────────────────────────────────────────
     "file.edited": async () => {
-      filesEdited++
-      await updatePresence(projectName, "Editing code", statsLine())
+      presence.filesEdited++
+      fireAndForget(presence.update("Editing code", presence.statsLine()))
     },
   }
 }

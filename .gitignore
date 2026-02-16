@@ -3,3 +3,5 @@ package-lock.json
 bun.lock
 *.bak
 .DS_Store
+.env
+.env.local
